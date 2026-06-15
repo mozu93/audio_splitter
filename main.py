@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from updater import APP_VERSION, check_latest_version, is_newer_version, download_update, launch_updater
+
 SUPPORTED_EXTENSIONS = {".m4a", ".mp3"}
 
 
@@ -74,6 +76,127 @@ def find_ffmpeg() -> str | None:
     return None
 
 
+# ── アップデート関連ワーカー ──────────────────────────────────────────
+
+
+class UpdateCheckWorker(QThread):
+    updateFound = Signal(str, str, str)  # tag, download_url, html_url
+
+    def run(self):
+        info = check_latest_version()
+        if info and is_newer_version(APP_VERSION, info["tag_name"]):
+            self.updateFound.emit(info["tag_name"], info["download_url"], info["html_url"])
+
+
+class DownloadWorker(QThread):
+    progress = Signal(int, int)  # received, total
+    finished = Signal(str)       # tmp_path
+    failed = Signal()
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        path = download_update(self.url, lambda r, t: self.progress.emit(r, t))
+        if path:
+            self.finished.emit(path)
+        else:
+            self.failed.emit()
+
+
+class UpdateBanner(QFrame):
+    """新バージョン検出 → ダウンロード → 自己更新バナー"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("UpdateBanner")
+        self.setVisible(False)
+        self._download_url = ""
+        self._installer_path = ""
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 7, 14, 7)
+
+        self._msg = QLabel("")
+        self._msg.setStyleSheet("color: #713F12; font-size: 13px;")
+        row.addWidget(self._msg)
+        row.addStretch()
+
+        self._dl_btn = QPushButton("ダウンロード")
+        self._dl_btn.setFixedHeight(28)
+        self._dl_btn.clicked.connect(self._start_download)
+        self._dl_btn.setVisible(False)
+        row.addWidget(self._dl_btn)
+
+        self._progress_label = QLabel("")
+        self._progress_label.setStyleSheet("color: #713F12; font-size: 12px; min-width: 120px;")
+        self._progress_label.setVisible(False)
+        row.addWidget(self._progress_label)
+
+        self._install_btn = QPushButton("今すぐ更新して再起動")
+        self._install_btn.setFixedHeight(28)
+        self._install_btn.clicked.connect(self._install)
+        self._install_btn.setVisible(False)
+        row.addWidget(self._install_btn)
+
+        dismiss = QPushButton("✕")
+        dismiss.setFixedSize(26, 26)
+        dismiss.setObjectName("DismissBtn")
+        dismiss.clicked.connect(lambda: self.setVisible(False))
+        row.addWidget(dismiss)
+
+        self._check_worker = UpdateCheckWorker()
+        self._check_worker.updateFound.connect(self._on_update_found)
+        self._check_worker.start()
+
+    def _on_update_found(self, tag: str, download_url: str, html_url: str):
+        self._download_url = download_url
+        self._msg.setText(f"新しいバージョン {tag} があります（現在: v{APP_VERSION}）")
+        self._dl_btn.setVisible(True)
+        self.setVisible(True)
+
+    def _start_download(self):
+        self._dl_btn.setVisible(False)
+        self._progress_label.setText("準備中...")
+        self._progress_label.setVisible(True)
+        self._dl_worker = DownloadWorker(self._download_url)
+        self._dl_worker.progress.connect(self._on_progress)
+        self._dl_worker.finished.connect(self._on_finished)
+        self._dl_worker.failed.connect(self._on_failed)
+        self._dl_worker.start()
+
+    def _on_progress(self, received: int, total: int):
+        mb_r = received / 1048576
+        if total > 0:
+            self._progress_label.setText(f"{mb_r:.1f} / {total / 1048576:.1f} MB")
+        else:
+            self._progress_label.setText(f"{mb_r:.1f} MB...")
+
+    def _on_finished(self, path: str):
+        self._installer_path = path
+        self._progress_label.setVisible(False)
+        self._msg.setText("ダウンロード完了！インストールしてアプリを更新できます。")
+        self._install_btn.setVisible(True)
+
+    def _on_failed(self):
+        self._progress_label.setVisible(False)
+        self._msg.setText("ダウンロードに失敗しました。")
+        self._dl_btn.setText("再試行")
+        self._dl_btn.setVisible(True)
+
+    def _install(self):
+        if not self._installer_path:
+            return
+        if getattr(sys, "frozen", False):
+            launch_updater(self._installer_path)
+        else:
+            subprocess.Popen([self._installer_path])
+
+
+# ── ドロップエリア ────────────────────────────────────────────────────
+
+
 class DropArea(QFrame):
     fileDropped = Signal(str)
 
@@ -90,10 +213,7 @@ class DropArea(QFrame):
 
     def mousePressEvent(self, event):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "音声ファイルを選択",
-            "",
-            "音声ファイル (*.m4a *.mp3)",
+            self, "音声ファイルを選択", "", "音声ファイル (*.m4a *.mp3)",
         )
         if path:
             self.fileDropped.emit(path)
@@ -123,6 +243,9 @@ class DropArea(QFrame):
             self.fileDropped.emit(urls[0].toLocalFile())
 
 
+# ── 切り出しワーカー ──────────────────────────────────────────────────
+
+
 class CutWorker(QThread):
     finishedOk = Signal(str)
     failed = Signal(str)
@@ -140,8 +263,7 @@ class CutWorker(QThread):
         total_sec = self.end_sec - self.start_sec
         try:
             command = [
-                self.ffmpeg_path,
-                "-y",
+                self.ffmpeg_path, "-y",
                 "-ss", format_hhmmss(self.start_sec),
                 "-to", format_hhmmss(self.end_sec),
                 "-i", self.input_file,
@@ -159,23 +281,17 @@ class CutWorker(QThread):
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-
             for line in proc.stdout:
                 line = line.strip()
                 if line.startswith("out_time=") and total_sec > 0:
-                    # out_time=HH:MM:SS.ffffff
-                    time_str = line.split("=", 1)[1]
                     try:
-                        parts = time_str.split(":")
+                        parts = line.split("=", 1)[1].split(":")
                         current_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-                        pct = min(99, int(current_sec / total_sec * 100))
-                        self.progress.emit(pct)
+                        self.progress.emit(min(99, int(current_sec / total_sec * 100)))
                     except (ValueError, IndexError):
                         pass
-
             proc.wait()
             stderr_output = proc.stderr.read()
-
             if proc.returncode == 0 and Path(self.output_file).exists():
                 self.progress.emit(100)
                 self.finishedOk.emit(self.output_file)
@@ -185,10 +301,13 @@ class CutWorker(QThread):
             self.failed.emit(str(e))
 
 
+# ── メインウィンドウ ──────────────────────────────────────────────────
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("単純音声ファイル分割ソフト")
+        self.setWindowTitle(f"単純音声ファイル分割ソフト v{APP_VERSION}")
         screen = QApplication.primaryScreen().availableGeometry()
         w = min(760, screen.width() - 40)
         h = min(640, screen.height() - 60)
@@ -208,12 +327,23 @@ class MainWindow(QMainWindow):
         self.player.durationChanged.connect(self.on_duration_changed)
         self.player.positionChanged.connect(self._on_position_changed)
 
-        root = QWidget()
+        # コンテナ（バナー + スクロール）
+        container = QWidget()
+        self.setCentralWidget(container)
+        container_layout = QVBoxLayout(container)
+        container_layout.setSpacing(0)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.update_banner = UpdateBanner()
+        container_layout.addWidget(self.update_banner)
+
         scroll = QScrollArea()
-        scroll.setWidget(root)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        self.setCentralWidget(scroll)
+        container_layout.addWidget(scroll)
+
+        root = QWidget()
+        scroll.setWidget(root)
         layout = QVBoxLayout(root)
         layout.setSpacing(10)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -372,6 +502,25 @@ class MainWindow(QMainWindow):
             }
             QPushButton:disabled { background: #cbd5e1; color: #64748b; }
             QPushButton:hover:!disabled { background: #1d4ed8; }
+            QFrame#UpdateBanner {
+                background: #FEF9C3;
+                border-bottom: 1px solid #FDE047;
+            }
+            QFrame#UpdateBanner QPushButton {
+                padding: 4px 12px;
+                border-radius: 6px;
+                font-size: 12px;
+            }
+            QFrame#UpdateBanner QPushButton#DismissBtn {
+                background: transparent;
+                color: #713F12;
+                border: 1px solid #FDE047;
+                padding: 2px;
+                font-size: 11px;
+            }
+            QFrame#UpdateBanner QPushButton#DismissBtn:hover {
+                background: #FDE047;
+            }
             QLineEdit, QTimeEdit {
                 background: white;
                 border: 1px solid #cbd5e1;
@@ -447,7 +596,6 @@ class MainWindow(QMainWindow):
         self.cut_btn.setEnabled(bool(self.ffmpeg_path))
         self.position_slider.setValue(0)
         self.time_label.setText("--:--:-- / --:--:--")
-
         out = p.with_name(f"{p.stem}_cut{p.suffix}")
         self.output_edit.setText(str(out))
         self.duration_sec = None
@@ -505,8 +653,7 @@ class MainWindow(QMainWindow):
         self.play_btn.setText("▶ 再生")
 
     def rewind(self):
-        pos = max(0, self.player.position() - 10_000)
-        self.player.setPosition(pos)
+        self.player.setPosition(max(0, self.player.position() - 10_000))
 
     def fast_forward(self):
         duration = self.player.duration()

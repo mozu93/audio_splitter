@@ -34,7 +34,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name AudioSplitter --add-binary "ffmpeg.exe;." main.py
+          pyinstaller --noconfirm --onefile --windowed --name AudioSplitter --add-binary "ffmpeg.exe;." --add-data "updater.py;." main.py
 
       - name: Rename EXE
         shell: pwsh
