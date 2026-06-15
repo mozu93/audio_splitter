@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QScrollArea,
+    QSlider,
     QStyle,
     QTimeEdit,
     QVBoxLayout,
@@ -79,7 +81,7 @@ class DropArea(QFrame):
         super().__init__()
         self.setAcceptDrops(True)
         self.setObjectName("DropArea")
-        self.setMinimumHeight(150)
+        self.setMinimumHeight(100)
         self.label = QLabel("ここに m4a / mp3 ファイルをドラッグ＆ドロップ\nまたはクリックして選択")
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setStyleSheet("font-size: 18px; color: #334155;")
@@ -124,6 +126,7 @@ class DropArea(QFrame):
 class CutWorker(QThread):
     finishedOk = Signal(str)
     failed = Signal(str)
+    progress = Signal(int)  # 0-100
 
     def __init__(self, ffmpeg_path: str, input_file: str, output_file: str, start_sec: int, end_sec: int):
         super().__init__()
@@ -134,21 +137,20 @@ class CutWorker(QThread):
         self.end_sec = end_sec
 
     def run(self):
+        total_sec = self.end_sec - self.start_sec
         try:
             command = [
                 self.ffmpeg_path,
                 "-y",
-                "-ss",
-                format_hhmmss(self.start_sec),
-                "-to",
-                format_hhmmss(self.end_sec),
-                "-i",
-                self.input_file,
-                "-c",
-                "copy",
+                "-ss", format_hhmmss(self.start_sec),
+                "-to", format_hhmmss(self.end_sec),
+                "-i", self.input_file,
+                "-c", "copy",
+                "-progress", "pipe:1",
+                "-nostats",
                 self.output_file,
             ]
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -157,10 +159,28 @@ class CutWorker(QThread):
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            if result.returncode == 0 and Path(self.output_file).exists():
+
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time=") and total_sec > 0:
+                    # out_time=HH:MM:SS.ffffff
+                    time_str = line.split("=", 1)[1]
+                    try:
+                        parts = time_str.split(":")
+                        current_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                        pct = min(99, int(current_sec / total_sec * 100))
+                        self.progress.emit(pct)
+                    except (ValueError, IndexError):
+                        pass
+
+            proc.wait()
+            stderr_output = proc.stderr.read()
+
+            if proc.returncode == 0 and Path(self.output_file).exists():
+                self.progress.emit(100)
                 self.finishedOk.emit(self.output_file)
             else:
-                self.failed.emit(result.stderr or "ffmpegの実行に失敗しました。")
+                self.failed.emit(stderr_output or "ffmpegの実行に失敗しました。")
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -169,23 +189,34 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("単純音声ファイル分割ソフト")
-        self.resize(760, 560)
+        screen = QApplication.primaryScreen().availableGeometry()
+        w = min(760, screen.width() - 40)
+        h = min(640, screen.height() - 60)
+        self.resize(w, h)
+        self.move(screen.x() + (screen.width() - w) // 2, screen.y() + (screen.height() - h) // 2)
 
         self.ffmpeg_path = find_ffmpeg()
         self.current_file: str | None = None
         self.duration_sec: int | None = None
         self.worker: CutWorker | None = None
+        self._seeking = False
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
         self.audio_output.setVolume(0.8)
         self.player.durationChanged.connect(self.on_duration_changed)
+        self.player.positionChanged.connect(self._on_position_changed)
 
         root = QWidget()
-        self.setCentralWidget(root)
+        scroll = QScrollArea()
+        scroll.setWidget(root)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        self.setCentralWidget(scroll)
         layout = QVBoxLayout(root)
-        layout.setSpacing(14)
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
 
         title = QLabel("単純音声ファイル分割ソフト")
         title.setStyleSheet("font-size: 26px; font-weight: bold; color: #0f172a;")
@@ -203,21 +234,66 @@ class MainWindow(QMainWindow):
         self.file_label.setStyleSheet("font-size: 14px; color: #475569;")
         layout.addWidget(self.file_label)
 
-        row = QHBoxLayout()
-        self.play_btn = QPushButton("再生")
+        self.load_status_label = QLabel("")
+        self.load_status_label.setStyleSheet("font-size: 13px;")
+        layout.addWidget(self.load_status_label)
+
+        # 再生コントロール行
+        ctrl_row = QHBoxLayout()
+
+        self.rewind_btn = QPushButton("⏪ -10s")
+        self.rewind_btn.clicked.connect(self.rewind)
+        self.rewind_btn.setEnabled(False)
+        ctrl_row.addWidget(self.rewind_btn)
+
+        self.play_btn = QPushButton("▶ 再生")
         self.play_btn.clicked.connect(self.toggle_play)
         self.play_btn.setEnabled(False)
-        row.addWidget(self.play_btn)
+        ctrl_row.addWidget(self.play_btn)
 
-        self.stop_btn = QPushButton("停止")
+        self.forward_btn = QPushButton("+10s ⏩")
+        self.forward_btn.clicked.connect(self.fast_forward)
+        self.forward_btn.setEnabled(False)
+        ctrl_row.addWidget(self.forward_btn)
+
+        self.stop_btn = QPushButton("⏹ 停止")
         self.stop_btn.clicked.connect(self.stop_play)
         self.stop_btn.setEnabled(False)
-        row.addWidget(self.stop_btn)
+        ctrl_row.addWidget(self.stop_btn)
 
-        self.duration_label = QLabel("再生時間：--:--:--")
-        row.addWidget(self.duration_label)
-        row.addStretch()
-        layout.addLayout(row)
+        ctrl_row.addStretch()
+
+        self.time_label = QLabel("--:--:-- / --:--:--")
+        self.time_label.setStyleSheet("font-size: 13px; color: #334155;")
+        ctrl_row.addWidget(self.time_label)
+
+        layout.addLayout(ctrl_row)
+
+        # シークスライダー
+        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.sliderPressed.connect(self._on_slider_pressed)
+        self.position_slider.sliderReleased.connect(self._on_slider_released)
+        self.position_slider.sliderMoved.connect(self._on_slider_moved)
+        layout.addWidget(self.position_slider)
+
+        # 音量コントロール行
+        vol_row = QHBoxLayout()
+        vol_row.addWidget(QLabel("🔊 音量"))
+
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(80)
+        self.volume_slider.setMaximumWidth(160)
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        vol_row.addWidget(self.volume_slider)
+
+        self.volume_label = QLabel("80%")
+        self.volume_label.setStyleSheet("color: #334155; min-width: 36px;")
+        vol_row.addWidget(self.volume_label)
+        vol_row.addStretch()
+
+        layout.addLayout(vol_row)
 
         form = QFormLayout()
         self.start_edit = QTimeEdit()
@@ -257,10 +333,18 @@ class MainWindow(QMainWindow):
         self.start_edit.timeChanged.connect(self.update_cut_info)
         self.end_edit.timeChanged.connect(self.update_cut_info)
 
+        # 進捗バー + パーセント表示
+        progress_row = QHBoxLayout()
         self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 100)
         self.progress.setVisible(False)
-        layout.addWidget(self.progress)
+        progress_row.addWidget(self.progress)
+
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet("color: #334155; min-width: 40px;")
+        self.progress_label.setVisible(False)
+        progress_row.addWidget(self.progress_label)
+        layout.addLayout(progress_row)
 
         self.cut_btn = QPushButton("切り取って保存")
         self.cut_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
@@ -304,6 +388,35 @@ class MainWindow(QMainWindow):
                 background: #eff6ff;
                 border: 2px dashed #2563eb;
             }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #e2e8f0;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #2563eb;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #2563eb;
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:disabled {
+                background: #94a3b8;
+            }
+            QProgressBar {
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                text-align: center;
+                background: #f1f5f9;
+            }
+            QProgressBar::chunk {
+                background: #2563eb;
+                border-radius: 6px;
+            }
         """)
 
     def update_ffmpeg_status(self):
@@ -321,44 +434,89 @@ class MainWindow(QMainWindow):
             return
         self.current_file = str(p)
         self.file_label.setText(f"選択中：{p.name}")
+        self.load_status_label.setText("⏳ 読み込み中...")
+        self.load_status_label.setStyleSheet("font-size: 13px; color: #b45309;")
         self.player.setSource(QUrl.fromLocalFile(str(p)))
         self.play_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
+        self.rewind_btn.setEnabled(True)
+        self.forward_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
         self.preview_start_btn.setEnabled(True)
         self.preview_end_btn.setEnabled(True)
         self.cut_btn.setEnabled(bool(self.ffmpeg_path))
+        self.position_slider.setValue(0)
+        self.time_label.setText("--:--:-- / --:--:--")
 
         out = p.with_name(f"{p.stem}_cut{p.suffix}")
         self.output_edit.setText(str(out))
         self.duration_sec = None
-        self.duration_label.setText("再生時間：読み込み中...")
         self.update_cut_info()
 
     def on_duration_changed(self, duration_ms: int):
         if duration_ms > 0:
             self.duration_sec = int(duration_ms / 1000)
-            self.duration_label.setText(f"再生時間：{format_hhmmss(self.duration_sec)}")
+            self.position_slider.setRange(0, duration_ms)
+            self._update_time_label(0)
+            self.load_status_label.setText(f"✅ 読み込み完了（{format_hhmmss(self.duration_sec)}）")
+            self.load_status_label.setStyleSheet("font-size: 13px; color: #15803d;")
             if self.duration_sec < time_to_seconds(self.end_edit.time()):
                 self.end_edit.setTime(seconds_to_time(self.duration_sec))
             self.update_cut_info()
 
+    def _update_time_label(self, position_ms: int):
+        current = format_hhmmss(int(position_ms / 1000))
+        total = format_hhmmss(self.duration_sec) if self.duration_sec else "--:--:--"
+        self.time_label.setText(f"{current} / {total}")
+
+    def _on_position_changed(self, position_ms: int):
+        if not self._seeking:
+            self.position_slider.setValue(position_ms)
+        self._update_time_label(position_ms)
+
+    def _on_slider_pressed(self):
+        self._seeking = True
+
+    def _on_slider_released(self):
+        self.player.setPosition(self.position_slider.value())
+        self._seeking = False
+
+    def _on_slider_moved(self, value: int):
+        self._update_time_label(value)
+
+    def _on_volume_changed(self, value: int):
+        self.audio_output.setVolume(value / 100.0)
+        self.volume_label.setText(f"{value}%")
+
+    def _on_cut_progress(self, pct: int):
+        self.progress.setValue(pct)
+        self.progress_label.setText(f"{pct}%")
+
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
-            self.play_btn.setText("再生")
+            self.play_btn.setText("▶ 再生")
         else:
             self.player.play()
-            self.play_btn.setText("一時停止")
+            self.play_btn.setText("⏸ 一時停止")
 
     def stop_play(self):
         self.player.stop()
-        self.play_btn.setText("再生")
+        self.play_btn.setText("▶ 再生")
+
+    def rewind(self):
+        pos = max(0, self.player.position() - 10_000)
+        self.player.setPosition(pos)
+
+    def fast_forward(self):
+        duration = self.player.duration()
+        pos = min(duration, self.player.position() + 10_000) if duration > 0 else self.player.position() + 10_000
+        self.player.setPosition(pos)
 
     def seek_and_play(self, sec: int):
         self.player.setPosition(sec * 1000)
         self.player.play()
-        self.play_btn.setText("一時停止")
+        self.play_btn.setText("⏸ 一時停止")
 
     def select_output(self):
         if not self.current_file:
@@ -409,19 +567,26 @@ class MainWindow(QMainWindow):
         Path(output).parent.mkdir(parents=True, exist_ok=True)
 
         self.cut_btn.setEnabled(False)
+        self.progress.setValue(0)
         self.progress.setVisible(True)
+        self.progress_label.setText("0%")
+        self.progress_label.setVisible(True)
+
         self.worker = CutWorker(self.ffmpeg_path, self.current_file, output, start, end)
+        self.worker.progress.connect(self._on_cut_progress)
         self.worker.finishedOk.connect(self.on_cut_success)
         self.worker.failed.connect(self.on_cut_failed)
         self.worker.start()
 
     def on_cut_success(self, output: str):
         self.progress.setVisible(False)
+        self.progress_label.setVisible(False)
         self.cut_btn.setEnabled(True)
         QMessageBox.information(self, "完了", f"保存しました。\n{output}")
 
     def on_cut_failed(self, error: str):
         self.progress.setVisible(False)
+        self.progress_label.setVisible(False)
         self.cut_btn.setEnabled(True)
         QMessageBox.critical(self, "エラー", f"切り出しに失敗しました。\n\n{error[:2000]}")
 
