@@ -36,13 +36,13 @@ jobs:
         run: |
           pyinstaller --noconfirm --onefile --windowed --name AudioSplitter --add-binary "ffmpeg.exe;." main.py
 
-      - name: Package zip
+      - name: Rename EXE
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\AudioSplitter.exe -DestinationPath "AudioSplitter_${{ github.ref_name }}_windows.zip"
+          Rename-Item dist\AudioSplitter.exe "AudioSplitter_${{ github.ref_name }}_windows.exe"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: AudioSplitter_*.zip
+          files: dist\AudioSplitter_*.exe
           generate_release_notes: true
